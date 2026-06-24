@@ -1,9 +1,17 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
+import io
+import os
 import random
 import re
-import spacy
 
+import spacy
+import torch
+from PIL import Image
+from torchvision import transforms
+
+from .helper_lib.model import get_model
+from .helper_lib.data_loader import get_class_names
 
 class BigramModel:
     def __init__(self, corpus):
@@ -97,3 +105,60 @@ def get_embedding(word: str):
         "vector_dimension": token.vector.size,
         "embedding": token.vector.tolist()
     }
+    class_names = get_class_names()
+
+cnn_model = get_model("CNN")
+
+model_path = "models/cifar10_cnn.pth"
+
+if not os.path.exists(model_path):
+    raise FileNotFoundError(
+        "CNN model file was not found. Run train_cnn.py first."
+    )
+
+checkpoint = torch.load(model_path, map_location="cpu")
+
+cnn_model.load_state_dict(checkpoint["model_state_dict"])
+cnn_model.eval()
+
+image_transform = transforms.Compose([
+    transforms.Resize((64, 64)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=(0.4914, 0.4822, 0.4465),
+        std=(0.2470, 0.2435, 0.2616)
+    )
+])
+
+
+@app.post("/classify-image")
+async def classify_image(file: UploadFile = File(...)):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload an image file."
+        )
+
+    image_bytes = await file.read()
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file could not be read as an image."
+        )
+
+    image_tensor = image_transform(image).unsqueeze(0)
+
+    with torch.no_grad():
+        outputs = cnn_model(image_tensor)
+        probabilities = torch.softmax(outputs, dim=1)[0]
+        predicted_index = torch.argmax(probabilities).item()
+        confidence = probabilities[predicted_index].item()
+
+    return {
+          "predicted_class": get_class_names()[predicted_index],
+        "confidence": round(confidence, 4)
+    }
+ 
